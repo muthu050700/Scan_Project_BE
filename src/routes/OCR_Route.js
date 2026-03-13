@@ -5,7 +5,7 @@ const fs = require("fs");
 const { GoogleGenAI } = require("@google/genai");
 
 const upload = multer({ dest: "uploads/" });
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-2.5-flash-lite";
 
 function getAI() {
     if (!process.env.GEMINI_API_KEY) {

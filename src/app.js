@@ -4,7 +4,7 @@ const connectDB = require("./config/database");
 const cors = require("cors");
 
 const app = express();
-
+const PORT = process.env.PORT || 7777;
 // enable JSON parsing
 app.use(express.json());
 
@@ -29,8 +29,8 @@ connectDB().then(() => {
 
     console.log("Database connection connected successfully");
 
-    app.listen(7777, () => {
-        console.log("Server is successfully listening on port 7777");
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
     });
 
 }).catch(() => {

@@ -25,14 +25,17 @@ const OCR_Router = require("./routes/OCR_Route");
 app.use("/", OCR_Router);
 
 // start server
-connectDB().then(() => {
-
-    console.log("Database connection connected successfully");
-
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-    });
-
-}).catch(() => {
-    console.log("Database not connected");
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    
+    // Connect to database after server starts
+    connectDB()
+        .then(() => {
+            console.log("Database connection connected successfully");
+        })
+        .catch((err) => {
+            console.error("Database connection failed:", err.message);
+            // We don't exit the process here to allow the server to remain upright 
+            // for Render health checks and potential retry logic or debugging.
+        });
 });

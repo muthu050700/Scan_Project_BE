@@ -14,13 +14,11 @@
   "dependencies": {
     "@google-cloud/vision": "^5.3.4",
     "@google/genai": "^1.44.0",
-    "canvas": "^3.2.1",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "mongoose": "^9.2.1",
     "multer": "^2.1.1",
-    "pdf-poppler": "^0.2.3",
     "pdf-to-img": "^5.0.0",
     "sharp": "^0.34.5",
     "tesseract.js": "^7.0.0"

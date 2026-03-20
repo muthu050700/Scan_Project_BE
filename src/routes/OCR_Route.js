@@ -4,8 +4,38 @@ const multer = require("multer");
 const fs = require("fs");
 const { GoogleGenAI } = require("@google/genai");
 
-const upload = multer({ dest: "uploads/" });
-const MODEL = "gemini-2.5-flash-lite";
+const upload = multer({
+    dest: "uploads/",
+    limits: {
+        files: 10,                  // max 10 files per request
+        fileSize: 20 * 1024 * 1024, // max 20MB per file
+    },
+    fileFilter: (req, file, cb) => {
+        const allowed = [
+            "application/pdf",
+            "image/jpeg",
+            "image/jpg",
+            "image/png",
+            "image/webp",
+        ];
+        if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error(`Unsupported file type: ${file.mimetype}`), false);
+        }
+    },
+});
+
+const MODEL = "gemini-2.5-flash-lite"; // Use latest Gemini 2 Flash Lite for best OCR performance
+
+// ── Supported MIME types ──
+const SUPPORTED_TYPES = [
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+];
 
 function getAI() {
     if (!process.env.GEMINI_API_KEY) {
@@ -14,7 +44,7 @@ function getAI() {
     return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 }
 
-// ── PDF → base64 images (no GraphicsMagick needed) ──
+// ── PDF → base64 images ──
 async function pdfToImages(pdfBuffer) {
     const { pdf } = await import("pdf-to-img");
     const images = [];
@@ -25,6 +55,20 @@ async function pdfToImages(pdfBuffer) {
     return images;
 }
 
+// ── Process a single file → base64 image array ──
+async function fileToImages(file) {
+    const fileBuffer = fs.readFileSync(file.path);
+    const mimeType = file.mimetype;
+
+    if (mimeType === "application/pdf") {
+        return await pdfToImages(fileBuffer);
+    } else if (["image/jpeg", "image/png", "image/webp", "image/jpg"].includes(mimeType)) {
+        return [fileBuffer.toString("base64")];
+    }
+    throw new Error(`Unsupported file type: ${mimeType}`);
+}
+
+// ── Extract raw text from images via Gemini ──
 async function extractRawText(images) {
     const ai = getAI();
     const parts = [
@@ -45,6 +89,7 @@ async function extractRawText(images) {
     return response.text;
 }
 
+// ── Structure raw text into GST invoice JSON ──
 async function structureToGSTFormat(rawText) {
     const ai = getAI();
 
@@ -99,47 +144,160 @@ ${rawText}
     }
 }
 
+// ── Process ONE file end-to-end (OCR + structure) ──
+async function processFile(file, rawOnly = false) {
+    let images = [];
+    let errorMsg = null;
+
+    try {
+        images = await fileToImages(file);
+        const rawText = await extractRawText(images);
+
+        if (rawOnly) {
+            return {
+                fileName: file.originalname,
+                mimeType: file.mimetype,
+                pages: images.length,
+                success: true,
+                rawText,
+                invoices: [],
+            };
+        }
+
+        const invoices = await structureToGSTFormat(rawText);
+        return {
+            fileName: file.originalname,
+            mimeType: file.mimetype,
+            pages: images.length,
+            success: true,
+            rawText,
+            invoices,
+        };
+    } catch (err) {
+        errorMsg = err.message;
+        return {
+            fileName: file.originalname,
+            mimeType: file.mimetype,
+            pages: images.length,
+            success: false,
+            error: errorMsg,
+            rawText: null,
+            invoices: [],
+        };
+    } finally {
+        // Always clean up temp file
+        if (file?.path && fs.existsSync(file.path)) {
+            fs.unlinkSync(file.path);
+        }
+    }
+}
+
+// ── POST /ocr — single file (backward compatible) ──
 OCR_Router.post("/ocr", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const rawOnly = req.query.rawOnly === "true";
 
     try {
-        const fileBuffer = fs.readFileSync(req.file.path);
-        const mimeType = req.file.mimetype;
-        let images = [];
+        const result = await processFile(req.file, rawOnly);
 
-        if (mimeType === "application/pdf") {
-            images = await pdfToImages(fileBuffer);
-        } else if (["image/jpeg", "image/png", "image/webp", "image/jpg"].includes(mimeType)) {
-            images = [fileBuffer.toString("base64")];
-        } else {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: `Unsupported file type: ${mimeType}` });
+        if (!result.success) {
+            return res.status(500).json({ error: result.error });
         }
-
-        const rawText = await extractRawText(images);
-        fs.unlinkSync(req.file.path);
-
-        if (rawOnly) {
-            return res.json({ success: true, pages: images.length, rawText });
-        }
-
-        const invoices = await structureToGSTFormat(rawText);
 
         return res.json({
             success: true,
-            pages: images.length,
-            totalInvoices: invoices.length,
-            invoices,
-            rawText,
+            pages: result.pages,
+            totalInvoices: result.invoices.length,
+            invoices: result.invoices,
+            rawText: result.rawText,
         });
-
     } catch (err) {
         if (req.file?.path && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
         console.error("OCR Error:", err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// ── POST /ocr/batch — multiple files (up to 10) ──
+// Field name: "files" (array)
+// Optional query: ?rawOnly=true  → skip structuring
+// Optional query: ?mode=parallel (default) | sequential
+OCR_Router.post("/ocr/batch", upload.array("files", 10), async (req, res) => {
+    const files = req.files;
+
+    if (!files || files.length === 0) {
+        return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const rawOnly = req.query.rawOnly === "true";
+
+    // "sequential" mode processes one at a time (safer for rate limits)
+    // "parallel" mode (default) processes all files concurrently (faster)
+    // const mode = req.query.mode === "sequential" ? "sequential" : "sequential";
+    const mode = "sequential";
+
+    try {
+        let results = [];
+
+        if (mode === "parallel") {
+            // All files processed at the same time
+            results = await Promise.all(
+                files.map((file) => processFile(file, rawOnly))
+            );
+        } else {
+            // One file at a time — safer if Gemini rate limits are tight
+            for (const file of files) {
+                const result = await processFile(file, rawOnly);
+                results.push(result);
+            }
+        }
+
+        // ── Aggregate summary ──
+        const succeeded = results.filter((r) => r.success);
+        const failed = results.filter((r) => !r.success);
+        const allInvoices = succeeded.flatMap((r) => r.invoices);
+        const totalPages = succeeded.reduce((sum, r) => sum + r.pages, 0);
+
+        return res.json({
+            success: true,
+            mode,
+            summary: {
+                totalFiles: files.length,
+                successCount: succeeded.length,
+                failedCount: failed.length,
+                totalPages,
+                totalInvoices: allInvoices.length,
+            },
+            // Per-file breakdown
+            files: results.map((r) => ({
+                fileName: r.fileName,
+                mimeType: r.mimeType,
+                pages: r.pages,
+                success: r.success,
+                invoiceCount: r.invoices.length,
+                error: r.error || null,
+            })),
+            // All invoices from all files merged into one array
+            invoices: allInvoices,
+            // Raw text per file (useful for debugging)
+            rawTexts: results.map((r) => ({
+                fileName: r.fileName,
+                rawText: r.rawText,
+            })),
+        });
+    } catch (err) {
+        // Cleanup any remaining temp files on unexpected crash
+        if (files) {
+            files.forEach((file) => {
+                if (file?.path && fs.existsSync(file.path)) {
+                    fs.unlinkSync(file.path);
+                }
+            });
+        }
+        console.error("Batch OCR Error:", err.message);
         return res.status(500).json({ error: err.message });
     }
 });
